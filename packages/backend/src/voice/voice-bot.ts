@@ -7,7 +7,7 @@ import { StreamSignaling, type ActiveStream, type SignalingMessage } from './str
 import { SidecarClient } from './streaming/sidecar-client.js';
 import { SidecarProcess, type SidecarConfig } from './streaming/sidecar-process.js';
 import { STREAM_PRESETS, DEFAULT_PRESET, type VideoViewerInfo, type VideoStreamStatus } from './streaming/types.js';
-import { getCookieArgs, getYouTubeAudioStreamUrl } from './audio/youtube.js';
+import { getCookieArgs, getYouTubeAudioStream } from './audio/youtube.js';
 import { spawn } from 'child_process';
 
 /** Resolve a YouTube/yt-dlp-compatible URL to a direct stream URL */
@@ -410,9 +410,9 @@ export class VoiceBot extends EventEmitter {
     }
 
     // YouTube CDN URLs expire, so resolve immediately before every play/replay.
-    const playbackUrl = item.source === 'youtube'
-      ? await getYouTubeAudioStreamUrl(originalUrl)
-      : originalUrl;
+    const resolvedStream = item.source === 'youtube'
+      ? await getYouTubeAudioStream(originalUrl)
+      : { url: originalUrl, httpHeaders: {} };
 
     this.stopIcyPolling();
     this.stopPlayback();
@@ -429,7 +429,11 @@ export class VoiceBot extends EventEmitter {
     }
 
     try {
-      const stream = await this.pipeline.toPcmStream(playbackUrl, item.source === 'radio' ? 0 : startAtSeconds);
+      const stream = await this.pipeline.toPcmStream(
+        resolvedStream.url,
+        item.source === 'radio' ? 0 : startAtSeconds,
+        resolvedStream.httpHeaders,
+      );
       this.streamKill = stream.kill;
       this.streamChunks = [];
       this.streamChunksSize = 0;
@@ -437,18 +441,49 @@ export class VoiceBot extends EventEmitter {
       const epoch = ++this.loopEpoch;
       let inputEnded = false;
       let streamError: Error | null = null;
+      let stderr = '';
+      let startupSettled = false;
+      let resolveStartup!: () => void;
+      let rejectStartup!: (err: Error) => void;
+      const startup = new Promise<void>((resolve, reject) => {
+        resolveStartup = resolve;
+        rejectStartup = reject;
+      });
+      const startupTimeout = setTimeout(() => {
+        if (!startupSettled) {
+          startupSettled = true;
+          rejectStartup(new Error('Timed out waiting for FFmpeg to produce YouTube audio'));
+        }
+      }, 20_000);
 
       stream.stdout.on('data', (chunk: Buffer) => {
         if (epoch !== this.loopEpoch) return;
+        if (!startupSettled) {
+          startupSettled = true;
+          clearTimeout(startupTimeout);
+          resolveStartup();
+        }
         this.streamChunks.push(chunk);
         this.streamChunksSize += chunk.length;
+      });
+
+      stream.stderr.on('data', (chunk: Buffer) => {
+        stderr = (stderr + chunk.toString()).slice(-2_000);
       });
 
       stream.process.on('close', (code) => {
         if (epoch !== this.loopEpoch) return;
         inputEnded = true;
         if (code !== 0) {
-          streamError = new Error(`FFmpeg stream exited with code ${code}`);
+          const details = stderr.trim().split(/\r?\n/).slice(-2).join(' ');
+          streamError = new Error(`FFmpeg stream exited with code ${code}${details ? `: ${details}` : ''}`);
+        } else if (!startupSettled) {
+          streamError = new Error('FFmpeg closed before producing any audio');
+        }
+        if (streamError && !startupSettled) {
+          startupSettled = true;
+          clearTimeout(startupTimeout);
+          rejectStartup(streamError);
         }
       });
 
@@ -456,6 +491,11 @@ export class VoiceBot extends EventEmitter {
         if (epoch !== this.loopEpoch) return;
         inputEnded = true;
         streamError = err;
+        if (!startupSettled) {
+          startupSettled = true;
+          clearTimeout(startupTimeout);
+          rejectStartup(err);
+        }
       });
 
       const finishStream = () => {
@@ -541,9 +581,9 @@ export class VoiceBot extends EventEmitter {
       };
 
       this.playbackTimer = setTimeout(tick, 200);
+      await startup;
     } catch (err) {
-      this._isStreaming = false;
-      this.streamKill = null;
+      this.stopPlayback();
       this._status = 'connected';
       this._nowPlaying = null;
       this.emit('statusChange', this._status);

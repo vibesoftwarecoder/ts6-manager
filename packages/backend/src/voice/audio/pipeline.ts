@@ -94,12 +94,21 @@ export class AudioPipeline {
    * Stream audio from a URL to raw PCM (for live radio streams).
    * Returns a readable stdout stream + kill function. Does NOT buffer the entire stream.
    */
-  async toPcmStream(url: string, startAtSeconds: number = 0): Promise<{ stdout: Readable; process: ChildProcess; kill: () => void }> {
+  async toPcmStream(
+    url: string,
+    startAtSeconds: number = 0,
+    httpHeaders: Record<string, string> = {},
+  ): Promise<{ stdout: Readable; stderr: Readable; process: ChildProcess; kill: () => void }> {
     // C4: Validate URL before passing to ffmpeg
     const urlCheck = await validateUrl(url, { allowedProtocols: ['http:', 'https:'] });
     if (!urlCheck.valid) {
       throw new Error(`Stream URL blocked: ${urlCheck.error}`);
     }
+
+    const safeHeaders = Object.entries(httpHeaders)
+      .filter(([name, value]) => !/[\r\n]/.test(name) && !/[\r\n]/.test(value))
+      .map(([name, value]) => `${name}: ${value}`)
+      .join("\r\n");
 
     const args = [
       "-re", // consume finite sources in real time instead of buffering them in memory
@@ -107,6 +116,7 @@ export class AudioPipeline {
       "-reconnect_streamed", "1",
       "-reconnect_delay_max", "5",
       ...(startAtSeconds > 0 ? ["-ss", String(startAtSeconds)] : []),
+      ...(safeHeaders ? ["-headers", `${safeHeaders}\r\n`] : []),
       "-i", url,
       "-f", "s16le",
       "-acodec", "pcm_s16le",
@@ -119,6 +129,7 @@ export class AudioPipeline {
     const ffmpeg = spawn("ffmpeg", args, { shell: false });
     return {
       stdout: ffmpeg.stdout,
+      stderr: ffmpeg.stderr,
       process: ffmpeg,
       kill: () => {
         try { ffmpeg.kill("SIGKILL"); } catch { }

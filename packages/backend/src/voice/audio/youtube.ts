@@ -19,6 +19,11 @@ export interface YouTubeSearchResult {
   thumbnail: string;
 }
 
+export interface YouTubeAudioStream {
+  url: string;
+  httpHeaders: Record<string, string>;
+}
+
 // Shared cookie file path (set from settings)
 let ytCookieFile: string | null = null;
 
@@ -114,7 +119,7 @@ export function getYouTubeInfo(url: string): Promise<YouTubeInfo> {
  * written to disk. The result should not be persisted because YouTube stream
  * URLs expire.
  */
-export function getYouTubeAudioStreamUrl(url: string): Promise<string> {
+export function getYouTubeAudioStream(url: string): Promise<YouTubeAudioStream> {
   if (!isYouTubeUrl(url)) {
     return Promise.reject(new Error("Please provide a valid YouTube URL"));
   }
@@ -125,7 +130,8 @@ export function getYouTubeAudioStreamUrl(url: string): Promise<string> {
       "--no-playlist",
       "--no-warnings",
       "-f", "bestaudio/best",
-      "-g",
+      "--dump-single-json",
+      "--no-download",
       url,
     ], { shell: false });
 
@@ -139,11 +145,19 @@ export function getYouTubeAudioStreamUrl(url: string): Promise<string> {
         return reject(new Error(`yt-dlp stream resolution failed (code ${code}): ${stderr.slice(0, 200)}`));
       }
 
-      const streamUrl = stdout.trim().split(/\r?\n/).find(Boolean);
-      if (!streamUrl) {
-        return reject(new Error("yt-dlp returned no playable audio stream"));
+      try {
+        const selected = JSON.parse(stdout);
+        const streamUrl = selected.url || selected.requested_formats?.[0]?.url;
+        if (!streamUrl) {
+          return reject(new Error("yt-dlp returned no playable audio stream"));
+        }
+        resolve({
+          url: streamUrl,
+          httpHeaders: selected.http_headers || selected.requested_formats?.[0]?.http_headers || {},
+        });
+      } catch {
+        reject(new Error("Failed to parse the yt-dlp audio stream response"));
       }
-      resolve(streamUrl);
     });
 
     proc.on("error", (err) => {
