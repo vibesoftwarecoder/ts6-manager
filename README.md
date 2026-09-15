@@ -143,6 +143,8 @@ The backend proxies all TeamSpeak API calls. The frontend never has direct acces
 
 **Voice/Audio:** Custom TS3 voice protocol client (UDP), Opus encoding, FFmpeg, yt-dlp
 
+The backend Docker image includes an automatic YouTube Proof-of-Origin token provider. This is required by some YouTube media endpoints and prevents the common `HTTP 403: Forbidden` playback failure. Rebuild the backend image after upgrading so the provider and its matching plugin are installed together.
+
 **Video Streaming:** Go sidecar with Pion WebRTC v4, RTCP Sender Reports for A/V sync
 
 ## Quick Start (Docker)
