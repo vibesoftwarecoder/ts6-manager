@@ -296,6 +296,15 @@ musicBotRoutes.post('/:id/queue-url', async (req: Request, res: Response, next) 
     };
 
     bot.queue.add(queueItem);
+    let started = false;
+
+    // Match the in-channel !queue behavior: an idle connected bot should begin
+    // the newly queued track immediately, while a busy bot leaves it upcoming.
+    if (bot.status === 'connected') {
+      bot.queue.playAt(bot.queue.length - 1);
+      await bot.play(queueItem);
+      started = true;
+    }
 
     try {
       const prisma = req.app.locals.prisma;
@@ -318,7 +327,7 @@ musicBotRoutes.post('/:id/queue-url', async (req: Request, res: Response, next) 
       console.error('[music-bots.routes] Failed to save music request history:', saveErr);
     }
 
-    res.json({ success: true, queueItem, queueLength: bot.queue.length });
+    res.json({ success: true, started, queueItem, queueLength: bot.queue.length });
   } catch (err: any) {
     next(new AppError(500, `Failed to queue YouTube URL: ${err.message}`));
   }

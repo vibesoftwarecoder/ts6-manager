@@ -785,7 +785,7 @@ function BotsTab() {
         onEnqueueUrl={(url) => {
           if (showPlayDialog) {
             enqueueUrl.mutate({ botId: showPlayDialog, url }, {
-              onSuccess: () => toast.success('YouTube track added to queue'),
+              onSuccess: (data: any) => toast.success(data?.started ? 'Streaming from YouTube' : 'YouTube track added to queue'),
               onError: (error: any) => toast.error(error?.response?.data?.error || 'Failed to queue YouTube track'),
             });
           }
