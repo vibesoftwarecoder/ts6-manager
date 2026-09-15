@@ -51,7 +51,8 @@ Get started quickly with pre-built flow templates. Covers common use cases like 
 ### Music Bots
 - Multiple bots per server, each with independent queue and playback
 - Radio station streaming with ICY metadata and live title updates
-- YouTube playback via yt-dlp (search, download, queue)
+- Direct YouTube audio streaming via yt-dlp (search, play, and queue without downloading)
+- Optional YouTube downloads for tracks you want to keep in the local music library
 - Music library management (upload, organize, playlists)
 - Volume control, pause, skip, previous, shuffle, repeat
 - Stereo audio support with stable 20ms pacing

@@ -5,7 +5,7 @@ import { musicBotsApi } from '@/api/music.api';
 import {
   useMusicBots, useCreateMusicBot, useUpdateMusicBot, useDeleteMusicBot,
   useStartMusicBot, useStopMusicBot, useMusicBotState,
-  usePlaySong, usePlayUrl, usePausePlayback, useResumePlayback, useStopPlayback,
+  usePlaySong, usePlayUrl, useEnqueueUrl, usePausePlayback, useResumePlayback, useStopPlayback,
   useSkipTrack, usePreviousTrack, useSeek, useSetVolume,
   useEnqueue, useLoadPlaylist, useRemoveFromQueue, useClearQueue,
   useSetShuffle, useSetRepeat,
@@ -337,17 +337,19 @@ function BotPlayerCard({ bot, onEdit, onDelete, onPlay }: {
 
 // ─── Play Song Dialog ─────────────────────────────────────────────────────────
 
-function PlaySongDialog({ botId, onClose, onPlaySong, onPlayUrl, onEnqueue, onLoadPlaylist }: {
+function PlaySongDialog({ botId, serverConfigId, onClose, onPlaySong, onPlayUrl, onEnqueueUrl, onEnqueue, onLoadPlaylist }: {
   botId: number | null;
+  serverConfigId?: number;
   onClose: () => void;
   onPlaySong: (songId: number) => void;
   onPlayUrl: (url: string) => void;
+  onEnqueueUrl: (url: string) => void;
   onEnqueue: (songId: number) => void;
   onLoadPlaylist: (playlistId: number) => void;
 }) {
   const { selectedConfigId } = useServerStore();
   const { data: servers } = useServers();
-  const [serverId, setServerId] = useState<number | null>(selectedConfigId);
+  const [serverId, setServerId] = useState<number | null>(serverConfigId || selectedConfigId);
   const configId = serverId || selectedConfigId;
   const { data: songs } = useSongs(configId);
   const { data: playlists } = usePlaylists();
@@ -356,8 +358,24 @@ function PlaySongDialog({ botId, onClose, onPlaySong, onPlayUrl, onEnqueue, onLo
     queryFn: () => musicRequestsApi.list(configId!),
     enabled: !!configId,
   });
-  const [tab, setTab] = useState<'songs' | 'playlists' | 'history'>('songs');
+  const ytSearch = useYouTubeSearch();
+  const [tab, setTab] = useState<'songs' | 'youtube' | 'playlists' | 'history'>('songs');
   const [filter, setFilter] = useState('');
+  const [youtubeUrl, setYoutubeUrl] = useState('');
+  const [youtubeQuery, setYoutubeQuery] = useState('');
+  const [youtubeResults, setYoutubeResults] = useState<YouTubeSearchResult[]>([]);
+
+  useEffect(() => {
+    if (botId !== null) setServerId(serverConfigId || selectedConfigId);
+  }, [botId, serverConfigId, selectedConfigId]);
+
+  const searchYouTube = () => {
+    if (!configId || !youtubeQuery.trim()) return;
+    ytSearch.mutate({ configId, query: youtubeQuery.trim() }, {
+      onSuccess: (data: any) => setYoutubeResults(Array.isArray(data) ? data : data?.results || []),
+      onError: () => toast.error('YouTube search failed'),
+    });
+  };
 
   const serverList = Array.isArray(servers) ? servers : [];
   const songList = (Array.isArray(songs) ? songs : []) as SongInfo[];
@@ -372,7 +390,7 @@ function PlaySongDialog({ botId, onClose, onPlaySong, onPlayUrl, onEnqueue, onLo
       <DialogContent className="max-w-lg max-h-[80vh] flex flex-col">
         <DialogHeader>
           <DialogTitle>Play Music</DialogTitle>
-          <DialogDescription>Select a song or playlist to play on this bot.</DialogDescription>
+          <DialogDescription>Play local music or stream YouTube audio without downloading it.</DialogDescription>
         </DialogHeader>
 
         <div className="flex items-center gap-2 mb-2">
@@ -385,6 +403,11 @@ function PlaySongDialog({ botId, onClose, onPlaySong, onPlayUrl, onEnqueue, onLo
             onClick={() => setTab('playlists')}
           >
             <ListMusic className="h-3 w-3 mr-1" /> Playlists
+          </Button>
+          <Button variant={tab === 'youtube' ? 'default' : 'outline'} size="sm" className="h-7 text-xs"
+            onClick={() => setTab('youtube')}
+          >
+            <Youtube className="h-3 w-3 mr-1" /> YouTube
           </Button>
           <Button variant={tab === 'history' ? 'default' : 'outline'} size="sm" className="h-7 text-xs"
             onClick={() => setTab('history')}
@@ -461,6 +484,75 @@ function PlaySongDialog({ botId, onClose, onPlaySong, onPlayUrl, onEnqueue, onLo
           </div>
         )}
 
+        {tab === 'youtube' && (
+          <div className="flex-1 max-h-[430px] overflow-y-auto space-y-3 pr-1">
+            <div className="rounded-md border border-dashed p-3 space-y-2">
+              <Label className="text-xs">YouTube URL</Label>
+              <Input
+                value={youtubeUrl}
+                onChange={(e) => setYoutubeUrl(e.target.value)}
+                placeholder="https://www.youtube.com/watch?v=..."
+                className="h-8 text-xs"
+              />
+              <div className="flex justify-end gap-2">
+                <Button variant="outline" size="sm" className="h-7 text-xs"
+                  disabled={!youtubeUrl.trim()}
+                  onClick={() => onEnqueueUrl(youtubeUrl.trim())}
+                >
+                  <Plus className="h-3 w-3 mr-1" /> Queue
+                </Button>
+                <Button size="sm" className="h-7 text-xs"
+                  disabled={!youtubeUrl.trim()}
+                  onClick={() => onPlayUrl(youtubeUrl.trim())}
+                >
+                  <Play className="h-3 w-3 mr-1" /> Play now
+                </Button>
+              </div>
+            </div>
+
+            <div className="flex gap-2">
+              <Input
+                value={youtubeQuery}
+                onChange={(e) => setYoutubeQuery(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && searchYouTube()}
+                placeholder="Search YouTube..."
+                className="h-8 text-xs"
+              />
+              <Button variant="outline" size="sm" className="h-8"
+                onClick={searchYouTube}
+                disabled={!configId || !youtubeQuery.trim() || ytSearch.isPending}
+              >
+                {ytSearch.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Search className="h-3.5 w-3.5" />}
+              </Button>
+            </div>
+
+            {youtubeResults.length > 0 && (
+              <div className="space-y-1">
+                {youtubeResults.map((result) => {
+                  const url = `https://www.youtube.com/watch?v=${result.id}`;
+                  return (
+                    <div key={result.id} className="flex items-center gap-2 rounded px-2 py-1.5 hover:bg-muted/30 group">
+                      {result.thumbnail && <img src={result.thumbnail} alt="" className="h-9 w-14 rounded object-cover shrink-0" />}
+                      <div className="min-w-0 flex-1">
+                        <p className="text-xs font-medium truncate">{result.title}</p>
+                        <p className="text-[10px] text-muted-foreground truncate">{result.artist} · {formatTime(result.duration)}</p>
+                      </div>
+                      <div className="flex gap-1 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
+                        <Button variant="outline" size="sm" className="h-6 px-2 text-[10px]" onClick={() => onEnqueueUrl(url)}>
+                          <Plus className="h-3 w-3 mr-0.5" /> Queue
+                        </Button>
+                        <Button size="sm" className="h-6 px-2 text-[10px]" onClick={() => onPlayUrl(url)}>
+                          <Play className="h-3 w-3 mr-0.5" /> Play
+                        </Button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
         {tab === 'history' && (
           <div className="flex-1 max-h-[400px] overflow-y-auto">
             {history.length === 0 ? (
@@ -502,6 +594,7 @@ function BotsTab() {
   const deleteBot = useDeleteMusicBot();
   const playSong = usePlaySong();
   const playUrl = usePlayUrl();
+  const enqueueUrl = useEnqueueUrl();
   const enqueueSong = useEnqueue();
   const loadPlaylist = useLoadPlaylist();
 
@@ -671,6 +764,7 @@ function BotsTab() {
       {/* Play Song Dialog */}
       <PlaySongDialog
         botId={showPlayDialog}
+        serverConfigId={bots.find((bot: MusicBotSummary) => bot.id === showPlayDialog)?.serverConfigId}
         onClose={() => setShowPlayDialog(null)}
         onPlaySong={(songId) => {
           if (showPlayDialog) {
@@ -683,8 +777,16 @@ function BotsTab() {
         onPlayUrl={(url) => {
           if (showPlayDialog) {
             playUrl.mutate({ botId: showPlayDialog, url }, {
-              onSuccess: () => { toast.success('Playing URL'); setShowPlayDialog(null); },
-              onError: () => toast.error('Failed to play URL'),
+              onSuccess: () => { toast.success('Streaming from YouTube'); setShowPlayDialog(null); },
+              onError: (error: any) => toast.error(error?.response?.data?.error || 'Failed to stream from YouTube'),
+            });
+          }
+        }}
+        onEnqueueUrl={(url) => {
+          if (showPlayDialog) {
+            enqueueUrl.mutate({ botId: showPlayDialog, url }, {
+              onSuccess: () => toast.success('YouTube track added to queue'),
+              onError: (error: any) => toast.error(error?.response?.data?.error || 'Failed to queue YouTube track'),
             });
           }
         }}

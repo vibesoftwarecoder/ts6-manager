@@ -2,9 +2,8 @@ import type { PrismaClient } from '../../generated/prisma/index.js';
 import { VoiceBotManager } from './voice-bot-manager.js';
 import type { VoiceBot } from './voice-bot.js';
 import type { QueueItem } from './playlist/queue.js';
-import { downloadYouTube } from './audio/youtube.js';
+import { getYouTubeInfo } from './audio/youtube.js';
 
-const MUSIC_DIR = process.env.MUSIC_DIR || '/data/music';
 const CMD_PREFIX = '!';
 
 const MUSIC_COMMANDS = new Set([
@@ -195,14 +194,14 @@ export class MusicCommandHandler {
     this.reply(bot, userClid, 'Loading...');
 
     try {
-      const { filePath, info } = await downloadYouTube(args, MUSIC_DIR);
+      const info = await getYouTubeInfo(args);
 
       const queueItem: QueueItem = {
-        id: `yt_${info.id}`,
+        id: `yt_${info.id}_${Date.now()}`,
         title: info.title,
         artist: info.artist,
         duration: info.duration,
-        filePath,
+        filePath: '',
         source: 'youtube',
         sourceUrl: args,
       };
@@ -297,14 +296,14 @@ export class MusicCommandHandler {
     this.reply(bot, userClid, 'Loading...');
 
     try {
-      const { filePath, info } = await downloadYouTube(args, MUSIC_DIR);
+      const info = await getYouTubeInfo(args);
 
       const queueItem: QueueItem = {
-        id: `yt_${info.id}`,
+        id: `yt_${info.id}_${Date.now()}`,
         title: info.title,
         artist: info.artist,
         duration: info.duration,
-        filePath,
+        filePath: '',
         source: 'youtube',
         sourceUrl: args,
       };

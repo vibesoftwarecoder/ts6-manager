@@ -94,7 +94,7 @@ export class AudioPipeline {
    * Stream audio from a URL to raw PCM (for live radio streams).
    * Returns a readable stdout stream + kill function. Does NOT buffer the entire stream.
    */
-  async toPcmStream(url: string): Promise<{ stdout: Readable; process: ChildProcess; kill: () => void }> {
+  async toPcmStream(url: string, startAtSeconds: number = 0): Promise<{ stdout: Readable; process: ChildProcess; kill: () => void }> {
     // C4: Validate URL before passing to ffmpeg
     const urlCheck = await validateUrl(url, { allowedProtocols: ['http:', 'https:'] });
     if (!urlCheck.valid) {
@@ -102,9 +102,11 @@ export class AudioPipeline {
     }
 
     const args = [
+      "-re", // consume finite sources in real time instead of buffering them in memory
       "-reconnect", "1",
       "-reconnect_streamed", "1",
       "-reconnect_delay_max", "5",
+      ...(startAtSeconds > 0 ? ["-ss", String(startAtSeconds)] : []),
       "-i", url,
       "-f", "s16le",
       "-acodec", "pcm_s16le",

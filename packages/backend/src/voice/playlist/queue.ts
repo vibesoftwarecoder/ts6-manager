@@ -8,7 +8,7 @@ export interface QueueItem {
   filePath: string;
   source: "local" | "youtube" | "url" | "radio";
   sourceUrl?: string;
-  streamUrl?: string; // If set, play as live stream (radio) instead of file
+  streamUrl?: string; // Direct live stream URL (for example, a radio station)
 }
 
 export class PlayQueue {

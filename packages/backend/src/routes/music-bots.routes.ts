@@ -2,12 +2,10 @@ import { Router, Request, Response } from 'express';
 import { requireRole } from '../middleware/rbac.js';
 import { AppError } from '../middleware/error-handler.js';
 import type { VoiceBotManager } from '../voice/voice-bot-manager.js';
-import { downloadYouTube } from '../voice/audio/youtube.js';
+import { getYouTubeInfo } from '../voice/audio/youtube.js';
 import { playerWidgetToken } from './widget-public.routes.js';
 
 export const musicBotRoutes: Router = Router();
-
-const MUSIC_DIR = process.env.MUSIC_DIR || '/data/music';
 
 // All routes require admin role
 musicBotRoutes.use(requireRole('admin'));
@@ -226,14 +224,14 @@ musicBotRoutes.post('/:id/play-url', async (req: Request, res: Response, next) =
       throw new AppError(400, 'Bot is not connected');
     }
 
-    const { filePath, info } = await downloadYouTube(url, MUSIC_DIR);
+    const info = await getYouTubeInfo(url);
 
     const queueItem = {
-      id: `yt_${info.id}`,
+      id: `yt_${info.id}_${Date.now()}`,
       title: info.title,
       artist: info.artist,
       duration: info.duration,
-      filePath,
+      filePath: '',
       source: 'youtube' as const,
       sourceUrl: url,
     };
@@ -272,6 +270,57 @@ musicBotRoutes.post('/:id/play-url', async (req: Request, res: Response, next) =
     res.json({ success: true, queueItem });
   } catch (err: any) {
     next(new AppError(500, `Failed to play URL: ${err.message}`));
+  }
+});
+
+// POST /:id/queue-url — Queue YouTube audio without downloading it
+musicBotRoutes.post('/:id/queue-url', async (req: Request, res: Response, next) => {
+  try {
+    const manager: VoiceBotManager = req.app.locals.voiceBotManager;
+    const id = parseInt(req.params.id as string);
+    const { url } = req.body;
+    if (!url) throw new AppError(400, 'url is required');
+
+    const bot = manager.getBot(id);
+    if (!bot) throw new AppError(404, 'Music bot not found');
+
+    const info = await getYouTubeInfo(url);
+    const queueItem = {
+      id: `yt_${info.id}_${Date.now()}`,
+      title: info.title,
+      artist: info.artist,
+      duration: info.duration,
+      filePath: '',
+      source: 'youtube' as const,
+      sourceUrl: url,
+    };
+
+    bot.queue.add(queueItem);
+
+    try {
+      const prisma = req.app.locals.prisma;
+      await prisma.musicRequest.upsert({
+        where: {
+          serverConfigId_url: {
+            serverConfigId: bot.currentConfig.serverConfigId,
+            url,
+          },
+        },
+        update: { requestedAt: new Date(), title: info.title },
+        create: {
+          serverConfigId: bot.currentConfig.serverConfigId,
+          url,
+          title: info.title,
+          requestedAt: new Date(),
+        },
+      });
+    } catch (saveErr) {
+      console.error('[music-bots.routes] Failed to save music request history:', saveErr);
+    }
+
+    res.json({ success: true, queueItem, queueLength: bot.queue.length });
+  } catch (err: any) {
+    next(new AppError(500, `Failed to queue YouTube URL: ${err.message}`));
   }
 });
 

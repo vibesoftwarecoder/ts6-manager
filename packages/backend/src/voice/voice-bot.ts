@@ -7,7 +7,7 @@ import { StreamSignaling, type ActiveStream, type SignalingMessage } from './str
 import { SidecarClient } from './streaming/sidecar-client.js';
 import { SidecarProcess, type SidecarConfig } from './streaming/sidecar-process.js';
 import { STREAM_PRESETS, DEFAULT_PRESET, type VideoViewerInfo, type VideoStreamStatus } from './streaming/types.js';
-import { getCookieArgs } from './audio/youtube.js';
+import { getCookieArgs, getYouTubeAudioStreamUrl } from './audio/youtube.js';
 import { spawn } from 'child_process';
 
 /** Resolve a YouTube/yt-dlp-compatible URL to a direct stream URL */
@@ -108,6 +108,7 @@ export class VoiceBot extends EventEmitter {
   private streamChunks: Buffer[] = [];
   private streamChunksSize: number = 0;
   private streamStartTime: number = 0;
+  private pausedStreamPosition: number = 0;
 
   // Nickname "now playing" state
   private _originalNickname: string;
@@ -202,7 +203,13 @@ export class VoiceBot extends EventEmitter {
     if (this._isStreaming) {
       return {
         position: (Date.now() - this.streamStartTime) / 1000,
-        duration: 0, // Live stream — no known duration
+        duration: this._nowPlaying.duration ?? 0,
+      };
+    }
+    if (this._status === 'paused' && this.isStreamedItem(this._nowPlaying)) {
+      return {
+        position: this.pausedStreamPosition,
+        duration: this._nowPlaying.duration ?? 0,
       };
     }
     if (this.pcmFrames.length === 0) return null;
@@ -365,6 +372,13 @@ export class VoiceBot extends EventEmitter {
       throw new Error('Bot is not connected');
     }
 
+    // YouTube queue entries store only the stable watch URL. Resolve and stream
+    // a fresh temporary media URL when playback begins instead of downloading.
+    if (item.source === 'youtube' && item.sourceUrl && !item.filePath) {
+      await this.playStream(item);
+      return;
+    }
+
     this.stopIcyPolling();
     this.stopPlayback();
     this._nowPlaying = item;
@@ -386,34 +400,43 @@ export class VoiceBot extends EventEmitter {
     }
   }
 
-  async playStream(item: QueueItem): Promise<void> {
+  async playStream(item: QueueItem, startAtSeconds: number = 0): Promise<void> {
     if (this._status !== 'connected' && this._status !== 'playing' && this._status !== 'paused') {
       throw new Error('Bot is not connected');
     }
-    if (!item.streamUrl) {
-      throw new Error('No streamUrl provided');
+    const originalUrl = item.source === 'youtube' ? item.sourceUrl : item.streamUrl;
+    if (!originalUrl) {
+      throw new Error(item.source === 'youtube' ? 'No YouTube source URL provided' : 'No streamUrl provided');
     }
+
+    // YouTube CDN URLs expire, so resolve immediately before every play/replay.
+    const playbackUrl = item.source === 'youtube'
+      ? await getYouTubeAudioStreamUrl(originalUrl)
+      : originalUrl;
 
     this.stopIcyPolling();
     this.stopPlayback();
     this._nowPlaying = item;
     this._isStreaming = true;
     this._status = 'playing';
-    this.streamStartTime = Date.now();
+    this.pausedStreamPosition = 0;
+    this.streamStartTime = Date.now() - (startAtSeconds * 1000);
     this.emit('statusChange', this._status);
     this.emit('nowPlaying', item);
     this.updateNowPlayingNickname(item.title);
-    this.startIcyPolling(item.streamUrl);
+    if (item.source === 'radio') {
+      this.startIcyPolling(originalUrl);
+    }
 
     try {
-      const stream = await this.pipeline.toPcmStream(item.streamUrl);
+      const stream = await this.pipeline.toPcmStream(playbackUrl, item.source === 'radio' ? 0 : startAtSeconds);
       this.streamKill = stream.kill;
       this.streamChunks = [];
       this.streamChunksSize = 0;
 
       const epoch = ++this.loopEpoch;
-      let framesSent = 0;
-      const startTime = performance.now();
+      let inputEnded = false;
+      let streamError: Error | null = null;
 
       stream.stdout.on('data', (chunk: Buffer) => {
         if (epoch !== this.loopEpoch) return;
@@ -421,25 +444,52 @@ export class VoiceBot extends EventEmitter {
         this.streamChunksSize += chunk.length;
       });
 
-      stream.process.on('close', () => {
+      stream.process.on('close', (code) => {
         if (epoch !== this.loopEpoch) return;
-        this.client.sendVoiceStop();
-        this._isStreaming = false;
-        this.streamKill = null;
-        this._nowPlaying = null;
-        this._status = 'connected';
-        this.emit('statusChange', this._status);
-        this.emit('trackEnd', item);
+        inputEnded = true;
+        if (code !== 0) {
+          streamError = new Error(`FFmpeg stream exited with code ${code}`);
+        }
       });
 
       stream.process.on('error', (err) => {
         if (epoch !== this.loopEpoch) return;
+        inputEnded = true;
+        streamError = err;
+      });
+
+      const finishStream = () => {
+        if (epoch !== this.loopEpoch) return;
+
+        this.client.sendVoiceStop();
+        this.clearTimer();
         this._isStreaming = false;
         this.streamKill = null;
-        this._status = 'error';
-        this.emit('error', err);
+        this.streamChunks = [];
+        this.streamChunksSize = 0;
+        this._nowPlaying = null;
+        this._status = 'connected';
         this.emit('statusChange', this._status);
-      });
+        this.emit('trackEnd', item);
+
+        if (streamError) {
+          this.emit('error', streamError);
+        }
+
+        // Radio is open-ended and should stop on disconnect. Finite streamed
+        // tracks participate in repeat and queue advancement like local files.
+        if (item.source === 'radio') {
+          this.resetNickname();
+          return;
+        }
+        if (this.queue.repeat === 'track') {
+          this.play(item).catch((err) => this.emit('error', err));
+          return;
+        }
+        const next = this.queue.next();
+        if (next) this.play(next).catch((err) => this.emit('error', err));
+        else this.resetNickname();
+      };
 
       let nextDue = performance.now() + 200; // initial buffer delay
 
@@ -465,6 +515,12 @@ export class VoiceBot extends EventEmitter {
         if (frame) {
           const opusFrame = this.pipeline.encodeFrame(frame, this.config.volume);
           this.sendVoiceFrame(opusFrame);
+        }
+
+        // FFmpeg has closed and all complete PCM frames have been delivered.
+        if (inputEnded && this.streamChunksSize < BYTES_PER_FRAME) {
+          finishStream();
+          return;
         }
 
         // Next slot
@@ -497,6 +553,17 @@ export class VoiceBot extends EventEmitter {
 
   pause(): void {
     if (this._status !== 'playing') return;
+
+    if (this._isStreaming && this._nowPlaying) {
+      this.pausedStreamPosition = Math.max(0, (Date.now() - this.streamStartTime) / 1000);
+      this.stopIcyPolling();
+      this.stopPlayback();
+      this.client.sendVoiceStop();
+      this._status = 'paused';
+      this.emit('statusChange', this._status);
+      return;
+    }
+
     this.pausedAtFrame = this.frameIndex;
     this.clearTimer();
     this.client.sendVoiceStop();
@@ -506,6 +573,14 @@ export class VoiceBot extends EventEmitter {
 
   resume(): void {
     if (this._status !== 'paused') return;
+
+    if (this.isStreamedItem(this._nowPlaying)) {
+      const item = this._nowPlaying;
+      const startAt = item.source === 'radio' ? 0 : this.pausedStreamPosition;
+      this.playStream(item, startAt).catch((err) => this.emit('error', err));
+      return;
+    }
+
     this.frameIndex = this.pausedAtFrame;
     this._status = 'playing';
     this.emit('statusChange', this._status);
@@ -514,6 +589,17 @@ export class VoiceBot extends EventEmitter {
 
   seek(seconds: number): void {
     if (this._status !== 'playing' && this._status !== 'paused') return;
+
+    if (this.isStreamedItem(this._nowPlaying) && this._nowPlaying.source !== 'radio') {
+      const item = this._nowPlaying;
+      const target = Math.max(0, Math.min(seconds, item.duration || seconds));
+      if (this._status === 'paused') {
+        this.pausedStreamPosition = target;
+      } else {
+        this.playStream(item, target).catch((err) => this.emit('error', err));
+      }
+      return;
+    }
     if (this.pcmFrames.length === 0) return;
 
     const targetFrame = Math.max(0, Math.min(
@@ -571,6 +657,7 @@ export class VoiceBot extends EventEmitter {
     this.stopPlayback();
     this.client.sendVoiceStop();
     this._nowPlaying = null;
+    this.pausedStreamPosition = 0;
     this.resetNickname();
     if (this._status === 'playing' || this._status === 'paused') {
       this._status = 'connected';
@@ -601,6 +688,10 @@ export class VoiceBot extends EventEmitter {
 
     this.streamChunksSize -= n;
     return out;
+  }
+
+  private isStreamedItem(item: QueueItem | null): item is QueueItem {
+    return !!item && (item.source === 'radio' || (item.source === 'youtube' && !!item.sourceUrl && !item.filePath));
   }
 
   private sendVoiceFrame(opusFrame: Buffer): void {

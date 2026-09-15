@@ -94,6 +94,15 @@ export function usePlayUrl() {
   });
 }
 
+export function useEnqueueUrl() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ botId, url }: { botId: number; url: string }) =>
+      musicBotsApi.enqueueUrl(botId, url),
+    onSuccess: (_, { botId }) => qc.invalidateQueries({ queryKey: ['music-bot-state', botId] }),
+  });
+}
+
 export function usePausePlayback() {
   const qc = useQueryClient();
   return useMutation({
