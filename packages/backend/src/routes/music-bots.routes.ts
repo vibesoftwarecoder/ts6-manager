@@ -300,7 +300,8 @@ musicBotRoutes.post('/:id/queue-url', async (req: Request, res: Response, next) 
 
     // Match the in-channel !queue behavior: an idle connected bot should begin
     // the newly queued track immediately, while a busy bot leaves it upcoming.
-    if (bot.status === 'connected') {
+    // A bot that is still starting a track reads 'connected' but is not idle.
+    if (bot.status === 'connected' && !bot.isLoadingTrack) {
       bot.queue.playAt(bot.queue.length - 1);
       await bot.play(queueItem);
       started = true;
