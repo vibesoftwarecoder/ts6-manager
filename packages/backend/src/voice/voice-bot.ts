@@ -486,6 +486,10 @@ export class VoiceBot extends EventEmitter {
       let inputEnded = false;
       let streamError: Error | null = null;
       let stderr = '';
+      let pcmBytes = 0;
+      // How far into the track FFmpeg got, for logs when a stream stops early.
+      const reachedSeconds = () =>
+        (item.source === 'radio' ? 0 : startAtSeconds) + (pcmBytes / BYTES_PER_FRAME) * (FRAME_MS / 1000);
       let startupSettled = false;
       let resolveStartup!: () => void;
       let rejectStartup!: (err: Error) => void;
@@ -513,10 +517,19 @@ export class VoiceBot extends EventEmitter {
         if (epoch !== this.loopEpoch) return;
         this.streamChunks.push(chunk);
         this.streamChunksSize += chunk.length;
+        pcmBytes += chunk.length;
       });
 
       stream.stderr.on('data', (chunk: Buffer) => {
-        stderr = (stderr + chunk.toString()).slice(-2_000);
+        const text = chunk.toString();
+        stderr = (stderr + text).slice(-2_000);
+        // FFmpeg recovers from these on its own; log them so a stream that
+        // keeps dropping can be told apart from one that simply ended.
+        for (const line of text.split(/\r?\n/)) {
+          if (/will reconnect/i.test(line)) {
+            console.warn(`[VoiceBot ${this.config.id}] "${item.title}" at ${reachedSeconds().toFixed(1)}s: ${line.trim()}`);
+          }
+        }
       });
 
       stream.process.on('close', (code) => {
@@ -529,11 +542,18 @@ export class VoiceBot extends EventEmitter {
           return;
         }
         inputEnded = true;
+        const details = stderr.trim().split(/\r?\n/).slice(-2).join(' ');
+        const reached = reachedSeconds();
+        const duration = item.source === 'radio' ? 0 : (item.duration ?? 0);
+        const at = `at ${reached.toFixed(1)}s${duration ? ` of ${duration}s` : ''}`;
         if (code !== 0) {
-          const details = stderr.trim().split(/\r?\n/).slice(-2).join(' ');
-          streamError = new Error(`FFmpeg stream exited with code ${code}${details ? `: ${details}` : ''}`);
+          streamError = new Error(`FFmpeg stream exited with code ${code} ${at}${details ? `: ${details}` : ''}`);
         } else if (!startupSettled) {
           streamError = new Error('FFmpeg closed before producing any audio');
+        } else if (duration && reached < duration - 5) {
+          // A clean exit well before the end means the source stopped
+          // sending; the queue advances as if the track had finished.
+          console.warn(`[VoiceBot ${this.config.id}] "${item.title}" ended early ${at}${details ? `: ${details}` : ''}`);
         }
         if (streamError && !startupSettled) {
           startupSettled = true;
