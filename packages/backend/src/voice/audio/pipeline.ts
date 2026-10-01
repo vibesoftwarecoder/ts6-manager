@@ -114,7 +114,17 @@ export class AudioPipeline {
       "-re", // consume finite sources in real time instead of buffering them in memory
       "-reconnect", "1",
       "-reconnect_streamed", "1",
-      "-reconnect_delay_max", "5",
+      // A fresh YouTube media URL sometimes answers 403 Forbidden for about
+      // 6.5 s after yt-dlp resolves it, then plays normally. Without a retry,
+      // FFmpeg exits at once and the track is skipped. FFmpeg waits 0, 1, 3
+      // and 7 s between attempts and stops before a 15 s wait, so the last
+      // attempt comes about 11 s in, inside the 20 s startup timeout. A
+      // 5 s maximum stopped after 4 s, too early for that window.
+      "-reconnect_delay_max", "10",
+      "-reconnect_on_http_error", "403",
+      // Without this, one timed-out connect during those retries ends the
+      // stream ("Connection to tcp://...:443 failed"), even with time left.
+      "-reconnect_on_network_error", "1",
       ...(startAtSeconds > 0 ? ["-ss", String(startAtSeconds)] : []),
       ...(safeHeaders ? ["-headers", `${safeHeaders}\r\n`] : []),
       "-i", url,
@@ -122,7 +132,9 @@ export class AudioPipeline {
       "-acodec", "pcm_s16le",
       "-ar", String(SAMPLE_RATE),
       "-ac", String(CHANNELS),
-      "-loglevel", "error",
+      // "warning" includes FFmpeg's "Will reconnect" lines, so a failure
+      // report shows whether retries were attempted.
+      "-loglevel", "warning",
       "pipe:1",
     ];
 
