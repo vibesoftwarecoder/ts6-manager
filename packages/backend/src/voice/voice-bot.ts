@@ -54,6 +54,9 @@ function resolveVideoUrl(url: string, maxHeight: number = 720): Promise<string> 
 
 export type VoiceBotStatus = 'stopped' | 'starting' | 'connected' | 'playing' | 'paused' | 'error';
 
+/** Queue auto-advance gives up after this many tracks in a row fail to start. */
+const MAX_CONSECUTIVE_TRACK_FAILURES = 3;
+
 export interface PlaybackProgress {
   position: number;  // seconds
   duration: number;  // seconds
@@ -92,6 +95,13 @@ export class VoiceBot extends EventEmitter {
   private frameIndex: number = 0;
   private pausedAtFrame: number = 0;
   private loopEpoch: number = 0;
+
+  // Every play()/playStream() call takes a new request number. Starting a
+  // YouTube track takes seconds (yt-dlp, then FFmpeg's first bytes), so a
+  // newer play, skip or stop can arrive meanwhile. A call whose number is no
+  // longer current has been superseded and must not touch playback state.
+  private playRequest: number = 0;
+  private loadingRequest: number = 0;
 
   private lastVoiceSendAt = 0;       // performance.now() timestamp
   private lastVoiceLogAt = 0;        // rate limit logs
@@ -148,6 +158,7 @@ export class VoiceBot extends EventEmitter {
     });
 
     this.client.on('disconnected', () => {
+      this.cancelPendingPlay();
       this.stopIcyPolling();
       this.stopPlayback();
       this._status = 'stopped';
@@ -196,6 +207,15 @@ export class VoiceBot extends EventEmitter {
 
   get manuallyStopped(): boolean {
     return this._manuallyStopped;
+  }
+
+  /**
+   * True while a track is being prepared but has not started yet. The status
+   * still reads 'connected' then, so callers that start playback only when the
+   * bot is idle must check this too.
+   */
+  get isLoadingTrack(): boolean {
+    return this.loadingRequest !== 0 && this.loadingRequest === this.playRequest;
   }
 
   get playbackProgress(): PlaybackProgress | null {
@@ -339,6 +359,7 @@ export class VoiceBot extends EventEmitter {
 
   async stop(): Promise<void> {
     this._manuallyStopped = true;
+    this.cancelPendingPlay();
     this.stopIcyPolling();
     this.resetNickname();
     this.stopPlayback();
@@ -379,6 +400,7 @@ export class VoiceBot extends EventEmitter {
       return;
     }
 
+    const request = this.beginPlayRequest();
     this.stopIcyPolling();
     this.stopPlayback();
     this._nowPlaying = item;
@@ -389,10 +411,14 @@ export class VoiceBot extends EventEmitter {
 
     try {
       const pcmData = await this.pipeline.toPcm(item.filePath);
+      if (request !== this.playRequest) return; // superseded while decoding
+      this.finishPlayRequest(request);
       this.pcmFrames = this.pipeline.splitFrames(pcmData);
       this.frameIndex = 0;
       this.startPlaybackLoop();
     } catch (err) {
+      if (request !== this.playRequest) return;
+      this.finishPlayRequest(request);
       this._status = 'connected';
       this._nowPlaying = null;
       this.emit('statusChange', this._status);
@@ -409,10 +435,23 @@ export class VoiceBot extends EventEmitter {
       throw new Error(item.source === 'youtube' ? 'No YouTube source URL provided' : 'No streamUrl provided');
     }
 
+    const request = this.beginPlayRequest();
+
     // YouTube CDN URLs expire, so resolve immediately before every play/replay.
-    const resolvedStream = item.source === 'youtube'
-      ? await getYouTubeAudioStream(originalUrl)
-      : { url: originalUrl, httpHeaders: {} };
+    let resolvedStream: { url: string; httpHeaders: Record<string, string> };
+    try {
+      resolvedStream = item.source === 'youtube'
+        ? await getYouTubeAudioStream(originalUrl)
+        : { url: originalUrl, httpHeaders: {} };
+    } catch (err) {
+      if (request !== this.playRequest) return;
+      this.finishPlayRequest(request);
+      throw err;
+    }
+    // A newer play, skip or stop arrived while yt-dlp was resolving. Starting
+    // now would cut off whatever that newer request started.
+    if (request !== this.playRequest) return;
+    this.finishPlayRequest(request);
 
     this.stopIcyPolling();
     this.stopPlayback();
@@ -434,6 +473,11 @@ export class VoiceBot extends EventEmitter {
         item.source === 'radio' ? 0 : startAtSeconds,
         resolvedStream.httpHeaders,
       );
+      if (request !== this.playRequest) {
+        // Superseded during URL validation; this FFmpeg was never registered.
+        stream.kill();
+        return;
+      }
       this.streamKill = stream.kill;
       this.streamChunks = [];
       this.streamChunksSize = 0;
@@ -442,6 +486,10 @@ export class VoiceBot extends EventEmitter {
       let inputEnded = false;
       let streamError: Error | null = null;
       let stderr = '';
+      let pcmBytes = 0;
+      // How far into the track FFmpeg got, for logs when a stream stops early.
+      const reachedSeconds = () =>
+        (item.source === 'radio' ? 0 : startAtSeconds) + (pcmBytes / BYTES_PER_FRAME) * (FRAME_MS / 1000);
       let startupSettled = false;
       let resolveStartup!: () => void;
       let rejectStartup!: (err: Error) => void;
@@ -456,29 +504,56 @@ export class VoiceBot extends EventEmitter {
         }
       }, 20_000);
 
+      // Startup is settled before the epoch checks below. If this stream is
+      // superseded before its first bytes, its handlers would otherwise return
+      // early forever, the 20 s timeout would fire, and the catch block below
+      // would run against the newer track.
       stream.stdout.on('data', (chunk: Buffer) => {
-        if (epoch !== this.loopEpoch) return;
         if (!startupSettled) {
           startupSettled = true;
           clearTimeout(startupTimeout);
           resolveStartup();
         }
+        if (epoch !== this.loopEpoch) return;
         this.streamChunks.push(chunk);
         this.streamChunksSize += chunk.length;
+        pcmBytes += chunk.length;
       });
 
       stream.stderr.on('data', (chunk: Buffer) => {
-        stderr = (stderr + chunk.toString()).slice(-2_000);
+        const text = chunk.toString();
+        stderr = (stderr + text).slice(-2_000);
+        // FFmpeg recovers from these on its own; log them so a stream that
+        // keeps dropping can be told apart from one that simply ended.
+        for (const line of text.split(/\r?\n/)) {
+          if (/will reconnect/i.test(line)) {
+            console.warn(`[VoiceBot ${this.config.id}] "${item.title}" at ${reachedSeconds().toFixed(1)}s: ${line.trim()}`);
+          }
+        }
       });
 
       stream.process.on('close', (code) => {
-        if (epoch !== this.loopEpoch) return;
+        if (epoch !== this.loopEpoch) {
+          if (!startupSettled) {
+            startupSettled = true;
+            clearTimeout(startupTimeout);
+            rejectStartup(new Error('FFmpeg stream was replaced before producing audio'));
+          }
+          return;
+        }
         inputEnded = true;
+        const details = stderr.trim().split(/\r?\n/).slice(-2).join(' ');
+        const reached = reachedSeconds();
+        const duration = item.source === 'radio' ? 0 : (item.duration ?? 0);
+        const at = `at ${reached.toFixed(1)}s${duration ? ` of ${duration}s` : ''}`;
         if (code !== 0) {
-          const details = stderr.trim().split(/\r?\n/).slice(-2).join(' ');
-          streamError = new Error(`FFmpeg stream exited with code ${code}${details ? `: ${details}` : ''}`);
+          streamError = new Error(`FFmpeg stream exited with code ${code} ${at}${details ? `: ${details}` : ''}`);
         } else if (!startupSettled) {
           streamError = new Error('FFmpeg closed before producing any audio');
+        } else if (duration && reached < duration - 5) {
+          // A clean exit well before the end means the source stopped
+          // sending; the queue advances as if the track had finished.
+          console.warn(`[VoiceBot ${this.config.id}] "${item.title}" ended early ${at}${details ? `: ${details}` : ''}`);
         }
         if (streamError && !startupSettled) {
           startupSettled = true;
@@ -488,9 +563,10 @@ export class VoiceBot extends EventEmitter {
       });
 
       stream.process.on('error', (err) => {
-        if (epoch !== this.loopEpoch) return;
-        inputEnded = true;
-        streamError = err;
+        if (epoch === this.loopEpoch) {
+          inputEnded = true;
+          streamError = err;
+        }
         if (!startupSettled) {
           startupSettled = true;
           clearTimeout(startupTimeout);
@@ -526,9 +602,7 @@ export class VoiceBot extends EventEmitter {
           this.play(item).catch((err) => this.emit('error', err));
           return;
         }
-        const next = this.queue.next();
-        if (next) this.play(next).catch((err) => this.emit('error', err));
-        else this.resetNickname();
+        this.playNextQueued();
       };
 
       let nextDue = performance.now() + 200; // initial buffer delay
@@ -583,6 +657,9 @@ export class VoiceBot extends EventEmitter {
       this.playbackTimer = setTimeout(tick, 200);
       await startup;
     } catch (err) {
+      // Only the current request may tear down playback. A superseded one
+      // would otherwise kill the FFmpeg and timer of the track that replaced it.
+      if (request !== this.playRequest) return;
       this.stopPlayback();
       this._status = 'connected';
       this._nowPlaying = null;
@@ -595,6 +672,9 @@ export class VoiceBot extends EventEmitter {
     if (this._status !== 'playing') return;
 
     if (this._isStreaming && this._nowPlaying) {
+      // resume() restarts the stream with a new request; a start still in
+      // progress must not overwrite the paused state when it settles.
+      this.cancelPendingPlay();
       this.pausedStreamPosition = Math.max(0, (Date.now() - this.streamStartTime) / 1000);
       this.stopIcyPolling();
       this.stopPlayback();
@@ -663,21 +743,18 @@ export class VoiceBot extends EventEmitter {
   }
 
   skip(): void {
+    this.cancelPendingPlay();
     this.stopIcyPolling();
     this.stopPlayback();
     this._nowPlaying = null;
     this._status = 'connected';
     this.emit('statusChange', this._status);
 
-    const next = this.queue.next();
-    if (next) {
-      this.play(next).catch((err) => this.emit('error', err));
-    } else {
-      this.resetNickname();
-    }
+    this.playNextQueued();
   }
 
   previous(): void {
+    this.cancelPendingPlay();
     this.stopIcyPolling();
     this.stopPlayback();
     this._nowPlaying = null;
@@ -693,6 +770,7 @@ export class VoiceBot extends EventEmitter {
   }
 
   stopAudio(): void {
+    this.cancelPendingPlay();
     this.stopIcyPolling();
     this.stopPlayback();
     this.client.sendVoiceStop();
@@ -703,6 +781,53 @@ export class VoiceBot extends EventEmitter {
       this._status = 'connected';
       this.emit('statusChange', this._status);
     }
+  }
+
+  /** Start a play request; any request still in progress is superseded. */
+  private beginPlayRequest(): number {
+    this.loadingRequest = ++this.playRequest;
+    return this.playRequest;
+  }
+
+  /** The request has stopped loading: it is now playing, or it failed. */
+  private finishPlayRequest(request: number): void {
+    if (this.loadingRequest === request) this.loadingRequest = 0;
+  }
+
+  /** Abandon a play request that is still loading (stop, skip, pause, disconnect). */
+  private cancelPendingPlay(): void {
+    this.playRequest++;
+    this.loadingRequest = 0;
+  }
+
+  /**
+   * Advance the queue and start the next track. A track that fails to start
+   * (yt-dlp error, unavailable video, FFmpeg timeout, missing file) is
+   * reported and skipped, so one bad entry does not end the whole queue.
+   */
+  private playNextQueued(failures: number = 0): void {
+    const next = this.queue.next();
+    if (!next) {
+      this.resetNickname();
+      return;
+    }
+
+    const attempt = this.play(next);
+    const request = this.playRequest;
+    attempt.catch((err) => {
+      this.emit('error', err);
+      // A newer play, skip, stop or disconnect owns playback now.
+      if (request !== this.playRequest || this._status !== 'connected') return;
+
+      const failed = failures + 1;
+      if (failed >= Math.min(MAX_CONSECUTIVE_TRACK_FAILURES, this.queue.length)) {
+        console.warn(`[VoiceBot ${this.config.id}] ${failed} queued track(s) in a row failed to start; stopping the queue`);
+        this.resetNickname();
+        return;
+      }
+      console.warn(`[VoiceBot ${this.config.id}] Skipping "${next.title}" after it failed to start`);
+      this.playNextQueued(failed);
+    });
   }
 
   private takeFromStreamChunks(n: number): Buffer | null {
@@ -821,9 +946,7 @@ export class VoiceBot extends EventEmitter {
           return;
         }
 
-        const next = this.queue.next();
-        if (next) this.play(next).catch((err) => this.emit('error', err));
-        else this.resetNickname();
+        this.playNextQueued();
         return;
       }
 

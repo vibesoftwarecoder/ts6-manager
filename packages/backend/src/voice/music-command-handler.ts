@@ -212,7 +212,7 @@ export class MusicCommandHandler {
       this.saveMusicRequest(bot, queueItem);
 
       // If something is already playing, queue it instead of interrupting
-      if (bot.status === 'playing' || bot.status === 'paused') {
+      if (bot.status === 'playing' || bot.status === 'paused' || bot.isLoadingTrack) {
         this.reply(bot, userClid, `Queued: ${info.artist} - ${info.title} (position #${bot.queue.length})`);
       } else {
         bot.queue.playAt(bot.queue.length - 1);
@@ -314,7 +314,7 @@ export class MusicCommandHandler {
       this.saveMusicRequest(bot, queueItem);
 
       // If nothing is playing, start playing the queued item
-      if (bot.status !== 'playing' && bot.status !== 'paused') {
+      if (bot.status !== 'playing' && bot.status !== 'paused' && !bot.isLoadingTrack) {
         bot.queue.playAt(bot.queue.length - 1);
         await bot.play(queueItem);
         this.reply(bot, userClid, `Now playing: ${info.artist} - ${info.title}`);
